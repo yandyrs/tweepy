@@ -43,7 +43,7 @@ def payload(payload_type, **payload_kwargs):
 class API:
     """Twitter API"""
 
-    def __init__(self, auth_handler=None,
+    def __init__(self, auth_handler=None, version='v1',
                  host='api.twitter.com', upload_host='upload.twitter.com',
                  cache=None, retry_count=0, retry_delay=0, retry_errors=None,
                  timeout=60, parser=None, wait_on_rate_limit=False, proxy=''):
@@ -51,6 +51,8 @@ class API:
         API instance constructor
 
         :param auth_handler:
+        :param version: Twitter API version 1 or 2. Allowed values are ['v1', 'v2'].
+                        default: 'v1'
         :param host: url of the server of the rest api,
                      default: 'api.twitter.com'
         :param upload_host: url of the upload server,
@@ -70,6 +72,7 @@ class API:
         :raise TypeError: If the given parser is not a ModelParser instance.
         """
         self.auth = auth_handler
+        self.version = version
         self.host = host
         self.upload_host = upload_host
         self.cache = cache
@@ -95,6 +98,22 @@ class API:
 
         self.session = requests.Session()
 
+
+    def _build_request_url(endpoint, upload_api):
+        '''Build the request URL to pass to the Twitter API based on function calling request()'''
+
+        if self.version == 'v1': 
+            url = f'https://{self.upload_host if upload_api else self.host}/1.1/{endpoint}.json'
+
+        elif self.version == 'v2':
+            url = f'https://{self.host}/2/{endpoint}.json'
+
+        else:
+            raise TypeError(f'API version is set to {self.version}. Should be either `v1` or `v2`')
+
+        return url
+
+
     def request(
         self, method, endpoint, *, endpoint_parameters=(), params=None,
         headers=None, json_payload=None, parser=None, payload_list=False,
@@ -108,12 +127,7 @@ class API:
 
         self.cached_result = False
 
-        # Build the request URL
-        path = f'/1.1/{endpoint}.json'
-        if upload_api:
-            url = 'https://' + self.upload_host + path
-        else:
-            url = 'https://' + self.host + path
+        url = self._build_request_url(endpoint, upload_api)
 
         if params is None:
             params = {}
@@ -1248,3 +1262,194 @@ class API:
         }
 
         return headers, body
+
+
+class APIv2:
+    """Twitter API v2"""
+
+    def __init__(self, auth_handler=None,
+                    host='api.twitter.com',
+                    cache=None, retry_count=0, retry_delay=0, retry_errors=None,
+                    timeout=60, parser=None, wait_on_rate_limit=False, proxy=''):
+        """
+        API v2 instance constructor
+
+        :param auth_handler: must be OAuth2
+        :param host: url of the server of the rest api,
+                        default: 'api.twitter.com'
+        :param cache: Cache to query if a GET method is used, default: None
+        :param retry_count: number of allowed retries, default: 0
+        :param retry_delay: delay in second between retries, default: 0
+        :param retry_errors: default: None
+        :param timeout: delay before to consider the request as timed out in
+                        seconds, default: 60
+        :param parser: ModelParser instance to parse the responses,
+                        default: None
+        :param wait_on_rate_limit: If the api wait when it hits the rate limit,
+                                    default: False
+        :param proxy: Url to use as proxy during the HTTP request, default: ''
+
+        :raise TypeError: If the given parser is not a ModelParser instance.
+        """
+        self.auth = auth_handler
+        self.host = host
+        self.cache = cache
+        self.retry_count = retry_count
+        self.retry_delay = retry_delay
+        self.retry_errors = retry_errors
+        self.timeout = timeout
+        self.wait_on_rate_limit = wait_on_rate_limit
+        self.parser = parser or ModelParser()
+        self.proxy = {}
+        if proxy:
+            self.proxy['https'] = proxy
+
+        # Attempt to explain more clearly the parser argument requirements
+        # https://github.com/tweepy/tweepy/issues/421
+
+        parser_type = Parser
+        if not isinstance(self.parser, parser_type):
+            raise TypeError(
+                f'"parser" argument has to be an instance of "{parser_type.__name__}".'
+                f' It is currently a {type(self.parser)}.'
+            )
+
+        self.session = requests.Session()
+
+
+    def request(
+        self, method, endpoint, *, endpoint_parameters=(), params=None,
+        headers=None, json_payload=None, parser=None, payload_list=False,
+        payload_type=None, post_data=None, require_auth=True,
+        return_cursors=False, use_cache=True, **kwargs
+    ):
+        # If authentication is required and no credentials
+        # are provided, throw an error.
+        if require_auth and not self.auth:
+            raise TweepError('Authentication required!')
+
+        self.cached_result = False
+
+        # Build the request URL
+        path = f'/2/{endpoint}.json'
+        url = 'https://' + self.host + path
+
+        if params is None:
+            params = {}
+        for k, arg in kwargs.items():
+            if arg is None:
+                continue
+            if k not in endpoint_parameters:
+                log.warning(f'Unexpected parameter: {k}')
+            params[k] = str(arg)
+        log.debug("PARAMS: %r", params)
+
+        # # Query the cache if one is available
+        # # and this request uses a GET method.
+        # if use_cache and self.cache and method == 'GET':
+        #     cache_result = self.cache.get(f'{path}?{urlencode(params)}')
+        #     # if cache result found and not expired, return it
+        #     if cache_result:
+        #         # must restore api reference
+        #         if isinstance(cache_result, list):
+        #             for result in cache_result:
+        #                 if isinstance(result, Model):
+        #                     result._api = self
+        #         else:
+        #             if isinstance(cache_result, Model):
+        #                 cache_result._api = self
+        #         self.cached_result = True
+        #         return cache_result
+
+        # Monitoring rate limits
+        remaining_calls = None
+        reset_time = None
+
+        if parser is None:
+            parser = self.parser
+
+        try:
+            # Continue attempting request until successful
+            # or maximum number of retries is reached.
+            retries_performed = 0
+            while retries_performed <= self.retry_count:
+                if (self.wait_on_rate_limit and reset_time is not None
+                    and remaining_calls is not None
+                    and remaining_calls < 1):
+                    # Handle running out of API calls
+                    sleep_time = reset_time - int(time.time())
+                    if sleep_time > 0:
+                        log.warning(f"Rate limit reached. Sleeping for: {sleep_time}")
+                        time.sleep(sleep_time + 1)  # Sleep for extra sec
+
+                # Apply authentication
+                auth = None
+                if self.auth:
+                    auth = self.auth.apply_auth()
+
+                # Execute request
+                try:
+                    resp = self.session.request(
+                        method, url, params=params, headers=headers,
+                        data=post_data, json=json_payload, timeout=self.timeout,
+                        auth=auth, proxies=self.proxy
+                    )
+                except Exception as e:
+                    raise TweepError(f'Failed to send request: {e}').with_traceback(sys.exc_info()[2])
+
+                if 200 <= resp.status_code < 300:
+                    break
+
+                rem_calls = resp.headers.get('x-rate-limit-remaining')
+                if rem_calls is not None:
+                    remaining_calls = int(rem_calls)
+                elif remaining_calls is not None:
+                    remaining_calls -= 1
+
+                reset_time = resp.headers.get('x-rate-limit-reset')
+                if reset_time is not None:
+                    reset_time = int(reset_time)
+
+                retry_delay = self.retry_delay
+                if resp.status_code in (420, 429) and self.wait_on_rate_limit:
+                    if remaining_calls == 0:
+                        # If ran out of calls before waiting switching retry last call
+                        continue
+                    if 'retry-after' in resp.headers:
+                        retry_delay = float(resp.headers['retry-after'])
+                elif self.retry_errors and resp.status_code not in self.retry_errors:
+                    # Exit request loop if non-retry error code
+                    break
+
+                # Sleep before retrying request again
+                time.sleep(retry_delay)
+                retries_performed += 1
+
+            # If an error was returned, throw an exception
+            self.last_response = resp
+            if resp.status_code and not 200 <= resp.status_code < 300:
+                try:
+                    error_msg, api_error_code = parser.parse_error(resp.text)
+                except Exception:
+                    error_msg = f"Twitter error response: status code = {resp.status_code}"
+                    api_error_code = None
+
+                if is_rate_limit_error_message(error_msg):
+                    raise RateLimitError(error_msg, resp)
+                else:
+                    raise TweepError(error_msg, resp, api_code=api_error_code)
+
+            # Parse the response payload
+            return_cursors = return_cursors or 'cursor' in params or 'next' in params
+            result = parser.parse(
+                resp.text, api=self, payload_list=payload_list,
+                payload_type=payload_type, return_cursors=return_cursors
+            )
+
+            # Store result into cache if one is available.
+            if use_cache and self.cache and method == 'GET' and result:
+                self.cache.store(f'{path}?{urlencode(params)}', result)
+
+            return result
+        finally:
+            self.session.close()
